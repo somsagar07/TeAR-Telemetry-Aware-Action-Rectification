@@ -1,0 +1,22 @@
+# Core: TAM training + robosuite evaluation
+torch>=2.0
+numpy>=1.23
+scipy>=1.9
+h5py>=3.7
+tqdm
+matplotlib
+
+# Simulation + policies
+robosuite>=1.4
+mujoco>=2.3
+gymnasium>=0.28
+# robomimic provides BC / BC-Transformer policy loading (policy_from_checkpoint)
+robomimic>=0.3
+# MimicGen task variants (Stack_D0, Threading_D0)
+mimicgen
+
+# --- Optional, for openvla/ multi-policy evaluation only ---
+# These pull in heavy policy stacks; install in a separate environment as needed.
+# transformers>=4.40
+# peft
+# accelerate

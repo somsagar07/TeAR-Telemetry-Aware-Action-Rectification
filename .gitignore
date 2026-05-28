@@ -1,0 +1,24 @@
+# Checkpoints, datasets, results, logs
+*.pt
+*.pth
+*.hdf5
+*.ckpt
+datasets/
+runs/
+results/
+outputs/
+checkpoints/
+*.log
+MUJOCO_LOG.TXT
+n50_manifest.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Figures / scratch
+*.mp4
+*.png
+*.pdf
