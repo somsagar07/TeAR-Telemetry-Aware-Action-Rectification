@@ -402,6 +402,49 @@ class MoEAdapter(BaseSFTAdapter):
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  TRANSIC-spirit no-telemetry baseline (state + a_base only, no gate)
+#  Same training recipe, same parameter budget, but the network never sees
+#  T / C / V and applies its correction unconditionally (gate ≡ 1).
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class NoTelemetryAdapter(BaseSFTAdapter):
+    """Learns the correction from (state, a_base) alone. No telemetry, no
+    structural gate. The closest in-paper analogue of a TRANSIC-style
+    learn-from-correction baseline: it sees the same demonstrations and the
+    same severity-augmented targets as TAM, but conditions only on
+    proprioceptive state."""
+
+    def __init__(self, hidden=128, n_blocks=2, **kw):
+        super().__init__(**kw)
+        # input dim: a_base + state (no T/C/V)
+        self.in_dim_nt = self.act_dim + self.state_dim
+        self.proj = nn.Linear(self.in_dim_nt, hidden)
+        self.blocks = nn.ModuleList([ResBlock(hidden) for _ in range(n_blocks)])
+        self.mean_head = nn.Linear(hidden, self.act_dim)
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+        self.value_head = nn.Sequential(
+            nn.Linear(self.in_dim_nt, hidden), nn.Tanh(), nn.Linear(hidden, 1)
+        )
+
+    def gate(self, temps, currents, voltages):
+        # Always-on: no telemetry-based gating. The correction is applied at every step.
+        return torch.ones_like(temps[..., :1])
+
+    def _delta(self, a_base, temps, state, currents, voltages):
+        x = torch.cat([a_base, state], dim=-1)
+        h = F.relu(self.proj(x))
+        for blk in self.blocks:
+            h = blk(h)
+        return self.mean_head(h)
+
+    def _value(self, a_base, temps, state, currents, voltages):
+        x = torch.cat([a_base, state], dim=-1)
+        return self.value_head(x).squeeze(-1)
+
+
 VARIANT_REGISTRY = {
     # name -> (class, ctor_kwargs)
     "mlp_h128_b2":    (MLPAdapter,        {"hidden": 128, "n_blocks": 2}),
@@ -415,7 +458,20 @@ VARIANT_REGISTRY = {
     "crossattn_h128": (CrossAttnAdapter,  {"hidden": 128, "n_heads": 4}),
     "hybrid_h128":    (HybridAdapter,     {"hidden": 128, "n_blocks": 2}),
     "moe4_h64":       (MoEAdapter,        {"hidden": 64,  "n_experts": 4, "n_blocks": 2}),
+    "no_telemetry":   (NoTelemetryAdapter, {"hidden": 128, "n_blocks": 2}),  # TRANSIC-spirit
 }
+
+# Channel-tokenized variant — destroys per-joint identity (paired ablation
+# vs TAM-BoT's per-joint tokenization). Imported lazily to avoid a circular
+# import with thermal_adapters.tam_bot_channel.
+def _channel_token_adapter(**kwargs):
+    from thermal_adapters.tam_bot_channel import ChannelTokenizedAdapter
+    return ChannelTokenizedAdapter(**kwargs)
+
+VARIANT_REGISTRY["channel_tok_h128"] = (_channel_token_adapter,
+    {"hidden": 128, "n_layers": 2, "n_heads": 4})
+VARIANT_REGISTRY["channel_tok_h128_l3"] = (_channel_token_adapter,
+    {"hidden": 128, "n_layers": 3, "n_heads": 4})
 
 
 def build(variant_name, state_dim, act_dim=7, alpha=0.3, log_std_init=-2.0):

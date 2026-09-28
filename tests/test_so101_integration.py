@@ -7,12 +7,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
+import pytest
 
 
 def test_so101_basic():
     """Test SO-101 loads and runs in robosuite Lift."""
     print("Test 1: SO-101 basic env...")
-    import register_so101
+    register_so101 = pytest.importorskip("register_so101", reason="Requires separate SO-101 simulation registration and assets")
 
     env = register_so101.make_so101_lift_env(
         has_renderer=False,
@@ -76,7 +77,7 @@ def test_so101_thermal_model():
 def test_so101_multiple_episodes():
     """Test running multiple episodes."""
     print("Test 3: Multiple episodes...")
-    import register_so101
+    register_so101 = pytest.importorskip("register_so101", reason="Requires separate SO-101 simulation registration and assets")
 
     env = register_so101.make_so101_lift_env(
         has_renderer=False,

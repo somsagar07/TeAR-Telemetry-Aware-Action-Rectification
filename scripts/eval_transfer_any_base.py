@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-architecture transfer eval: apply a TAM-BoT adapter (trained on a BC-T base)
+"""Cross-architecture transfer eval: apply a TeAR adapter (trained on a BC-T base)
 to ANY robomimic-loadable policy, including IRIS/HBC/BCQ where FrozenBase doesn't work.
 
 Bypasses FrozenBase entirely. Hardcodes state_dim by task (Lift=19, Can/Sq=23).
@@ -232,6 +232,65 @@ def _update_rho_estimate_from_obs(rho_hat_ema, action_commanded, action_executed
     return new_ema.astype(np.float32)
 
 
+def _sysid_features(T, C, V):
+    """Per-joint feature map phi(tau) in R^4 for the online sys-ID baseline."""
+    return np.stack([
+        np.ones_like(T),
+        (T - 42.0) / 33.0,
+        (C - 0.60) / 0.45,
+        (0.90 - V) / 0.45,
+    ], axis=-1).astype(np.float64)          # (n_joints, 4)
+
+
+def _init_sysid(n_joints=7, prior_var=100.0):
+    """Recursive-least-squares state: per-joint weights and covariance.
+
+    w init 0 => predicted log-capacity 0 => rho_hat = 1 (no degradation assumed),
+    matching the MRAC baseline's initialisation.
+    """
+    return {"w": np.zeros((n_joints, 4)),
+            "P": np.tile(np.eye(4) * prior_var, (n_joints, 1, 1))}
+
+
+def _online_sysid_correction(a_base, T, C, V, st, gamma_max=0.75):
+    """Online system identification with privileged simulator feedback.
+
+    Stronger than the MRAC/L1 baseline: instead of tracking a per-joint scalar
+    EMA of the current capacity, this fits a per-joint LINEAR MAP from telemetry
+    to log-capacity online, so it generalises to telemetry values it has not just
+    observed. Prediction is inverted and routed through the same smoothstep gate,
+    so it is identically zero at nominal telemetry like every other method here.
+    """
+    tg = np.clip((T - 42.0)/13.0, 0, 1); cg = np.clip((C - 0.60)/0.40, 0, 1); vg = np.clip((0.90 - V)/0.40, 0, 1)
+    g = np.clip(_smoothstep(tg) + _smoothstep(cg) + _smoothstep(vg), 0.0, 1.0)
+    phi = _sysid_features(T, C, V)                        # (7,4)
+    log_rho = np.einsum('jf,jf->j', phi, st["w"])
+    rho_hat = np.clip(np.exp(np.clip(log_rho, np.log(0.05), np.log(1.5))), 0.05, 1.5)
+    gamma = np.clip(1.0 / rho_hat, 1.0 - gamma_max, 1.0 + gamma_max)
+    a_corr = np.clip(a_base[:7] * gamma, -1, 1)
+    out = a_base.copy(); out[:7] = a_base[:7] * (1 - g) + a_corr * g
+    return out
+
+
+def _update_sysid(st, T, C, V, a_cmd, a_exec, lam=0.99, eps=0.05):
+    """RLS update from the observed commanded-vs-executed ratio (no oracle rho)."""
+    phi = _sysid_features(T, C, V)                        # (7,4)
+    a_c = a_cmd[:7]; a_e = a_exec[:7]
+    mask = np.abs(a_c) > eps
+    ratio = np.clip(np.abs(np.where(mask, a_e / (a_c + np.sign(a_c) * 1e-6), 1.0)), 0.05, 1.5)
+    y = np.log(ratio)
+    for j in range(len(y)):
+        if not mask[j]:
+            continue
+        p = phi[j]; P = st["P"][j]
+        Pp = P @ p
+        denom = lam + float(p @ Pp)
+        k = Pp / denom
+        st["w"][j] = st["w"][j] + k * (y[j] - float(p @ st["w"][j]))
+        st["P"][j] = (P - np.outer(k, Pp)) / lam
+    return st
+
+
 def _scalar_gain_correction(a_base, T, C, V, k=0.6):
     """Naive baseline: scale action toward zero when any channel stressed.
     a' = a * (k + (1-k)*(1-g)) per joint, where g is the same per-joint smoothstep gate.
@@ -295,7 +354,18 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
                  non_factorizable_rho=False, alpha_mag=0.4,
                  bounded_ffwd_gamma_max=None, fitted_rho=None,
                  mrac_baseline=False, mrac_gamma_max=0.75, mrac_ema_alpha=0.2,
-                 mrac_low_pass_alpha=None, log_corrections=False):
+                 mrac_low_pass_alpha=None, log_corrections=False, online_sysid=False,
+                 closed_loop=False, cl_ema_alpha=0.2, cl_rho_assumed=0.6, cl_warmup=5):
+    cl_gain = None
+    if closed_loop:
+        import sys as _s
+        _s.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tam_v2'))
+        from closed_loop import ClosedLoopGain
+        cl_gain = ClosedLoopGain(n_joints=7, alpha_ema=cl_ema_alpha,
+                                 rho_assumed=cl_rho_assumed, warmup=cl_warmup)
+        print(f'  [closed-loop] ema={cl_ema_alpha} rho_assumed={cl_rho_assumed} '
+              f'warmup={cl_warmup}', flush=True)
+
     env = make_env(task, horizon)
     fb = FrameBuffer(context_length)
     n_joints = 7
@@ -307,6 +377,9 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
         # MRAC/L1 baseline: per-joint EMA of observed ρ̂, init to 1 (no degradation assumed).
         # Resets each episode (simulates a fresh deployment with no prior memory).
         rho_hat_ema = np.ones(n_joints, dtype=np.float32) if mrac_baseline else None
+        # Learned online sys-ID baseline: RLS state, reset each episode (fresh deployment).
+        sysid_state = _init_sysid(n_joints) if online_sysid else None
+        a_cmd_for_sysid = None
         # Optional low-pass on the corrected action (L1-adaptive style filter).
         a_corrected_prev = None
         temps = t_fn(n_joints)
@@ -318,6 +391,8 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
                 temps, currents, voltages, alpha_TC=coupling_TC, alpha_CV=coupling_CV)
         else:
             temps_env, currents_env, voltages_env = temps, currents, voltages
+        if cl_gain is not None:
+            cl_gain.reset()
         raw = env.reset()
         policy.start_episode()
         fb.reset()
@@ -347,7 +422,6 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
             # Uses NO oracle ρ; learns ρ̂ online from action-vs-realized mismatch.
             a_commanded_for_mrac = None
             if mrac_baseline:
-                a_commanded_for_mrac = action.copy()  # remember pre-correction action
                 action = _mrac_correction(action, temps, currents, voltages,
                                          rho_hat_ema, gamma_max=mrac_gamma_max).astype(np.float32)
                 # L1-adaptive style low-pass filter on the corrected action.
@@ -355,6 +429,11 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
                     a = mrac_low_pass_alpha * action[:7] + (1 - mrac_low_pass_alpha) * a_corrected_prev[:7]
                     action[:7] = np.clip(a, -1, 1)
                 a_corrected_prev = action.copy()
+
+            # Online system identification diagnostic
+            if online_sysid:
+                action = _online_sysid_correction(action, temps, currents, voltages,
+                                                  sysid_state, gamma_max=mrac_gamma_max).astype(np.float32)
 
             # TAM correction
             if adapter is not None:
@@ -383,10 +462,24 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
                     corrected, _, _ = adapter(a_t, T_t, s_t, C_t, V_t)
                 a_base_pre = action.copy()
                 action = corrected.detach().squeeze(0).cpu().numpy()
+                # Closed-loop: scale the adapter's proposed correction by the
+                # authority loss actually measured from commanded-vs-executed
+                # motion, instead of trusting the telemetry reading alone. k<=1,
+                # so this can only ever reduce the correction, never add one; at
+                # cool telemetry the gate is already 0 so k multiplies zero and
+                # the bit-identical nominal guarantee is preserved.
+                if cl_gain is not None:
+                    action = cl_gain.apply(a_base_pre, action)
                 if log_corrections:
                     d = np.abs(action[:7] - a_base_pre[:7])
                     if d.shape[0] == 7:
                         corr_abs_sum += d; corr_steps += 1
+
+            # Estimate capacity from the final issued command, after corrections.
+            if online_sysid:
+                a_cmd_for_sysid = action.copy()
+            if mrac_baseline:
+                a_commanded_for_mrac = action.copy()
 
             # Degradation
             if non_factorizable_rho:
@@ -400,9 +493,15 @@ def run_episodes(policy, adapter, task, n, horizon, t_fn, c_fn, v_fn,
                 action_executed = voltage.apply_voltage_physics(a_post_C, voltages_env)
 
             # MRAC: update online ρ̂ estimate from observed-vs-commanded action ratio.
+            if online_sysid and a_cmd_for_sysid is not None:
+                sysid_state = _update_sysid(sysid_state, temps, currents, voltages,
+                                            a_cmd_for_sysid, action_executed)
             if mrac_baseline and a_commanded_for_mrac is not None:
                 rho_hat_ema = _update_rho_estimate_from_obs(
                     rho_hat_ema, a_commanded_for_mrac, action_executed, alpha_ema=mrac_ema_alpha)
+
+            if cl_gain is not None:
+                cl_gain.update(action, action_executed)
 
             action = action_executed
             raw, r, done, info = env.step(action)
@@ -430,6 +529,19 @@ def main():
     ap.add_argument("--horizon", type=int, default=400)
     ap.add_argument("--conditions", nargs="+", default=list(CONDITIONS))
     ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--adapter-config", help="Adapter config.json (defaults to file beside weights)")
+    ap.add_argument("--adapter-gamma-log-space", action="store_true",
+                    help="Adapter was trained with log-space gamma = exp(g*r*tanh(.)). "
+                         "MUST match training or gamma is computed wrongly.")
+    ap.add_argument("--adapter-gamma-range", type=float, default=None,
+                    help="Adapter's gamma_range at training time (distinct from the "
+                         "env's --gamma-range). Defaults to --gamma-range.")
+    ap.add_argument("--closed-loop", action="store_true",
+                    help="EXPERIMENTAL: uses privileged simulator command-response feedback to scale correction "
+                         "(rho_obs = |a_executed|/|a_commanded|); no hardware estimator is provided.")
+    ap.add_argument("--cl-ema-alpha", type=float, default=0.2)
+    ap.add_argument("--cl-rho-assumed", type=float, default=0.6)
+    ap.add_argument("--cl-warmup", type=int, default=5)
     ap.add_argument("--alpha", type=float, default=0.3)
     ap.add_argument("--gamma-range", type=float, default=0.5)
     ap.add_argument("--n-layers", type=int, default=3)
@@ -454,8 +566,21 @@ def main():
                     help="Current->voltage coupling strength alpha_CV (default 0.15).")
     ap.add_argument("--fit-error-sigma", type=float, default=0.0,
                     help="Realistic-deployment FFwd baseline: perturb rho_hat by N(0, sigma) multiplicative noise. sigma=0 is oracle (current default). sigma=0.10 models a 10%% fit-error on rho.")
+    ap.add_argument("--online-sysid", action="store_true",
+                    help="Diagnostic with privileged simulator command-response feedback: per-joint RLS "
+                         "fit of telemetry->log-capacity from commanded-vs-executed mismatch, then "
+                         "inverted. This is not a deployable-information peer.")
+    ap.add_argument("--env-curve-spec", type=str, default="",
+                    help="JSON overriding the env-side rho curves per channel, e.g. "
+                         "'{\"T\":[\"sigmoid\",{\"midpoint\":61,\"k\":0.3}],\"C\":[...],\"V\":[...]}'. "
+                         "The adapter is unchanged, so this measures transfer to a degradation "
+                         "model TAM was never trained against.")
+    ap.add_argument("--env-joint-grouping", type=str, default="",
+                    help="Override env-side joint->OSC axis grouping as 'p0,p1,..;r0,r1,..' "
+                         "(e.g. '0,1,2;4,5,6'). Adapter unchanged, so this measures sensitivity "
+                         "to a mis-specified mapping. Thermal channel only: use with hot/T_mod.")
     ap.add_argument("--env-curve", type=str, default="linear",
-                    choices=["linear", "exponential", "sigmoid", "polynomial", "kinky"],
+                    choices=["linear", "exponential", "sigmoid", "polynomial", "kinky", "sin"],
                     help="Family of degradation curves applied env-side.")
     ap.add_argument("--ffwd-curve", type=str, default="linear",
                     choices=["linear", "kinky"],
@@ -554,28 +679,73 @@ def main():
             if ckpt_sd != state_dim:
                 print(f"  WARN: adapter state_dim={ckpt_sd}, task expects {state_dim} — will pad/truncate")
                 state_dim = ckpt_sd
-        # Auto-detect architecture: joint_in (5 or 4), hidden, n_layers
-        use_action_magnitude = (sd['joint_proj.weight'].shape[1] == 5)
-        use_state_token = ('state_proj.weight' in sd)
-        hidden = sd['joint_proj.weight'].shape[0]
-        # Count transformer layers
-        n_layers = sum(1 for k in sd if k.startswith('transformer.layers.') and k.endswith('.norm1.weight'))
-        if n_layers == 0:
-            n_layers = args.n_layers
-        print(f"[load adapter] {args.adapter_ckpt} (state_dim={state_dim}, hidden={hidden}, n_layers={n_layers}, use_action_magnitude={use_action_magnitude}, use_state_token={use_state_token})", flush=True)
-        adapter = TAMBoT(
-            state_dim=state_dim, act_dim=7,
-            hidden=hidden, n_layers=n_layers, n_heads=args.n_heads,
-            alpha=args.alpha, gamma_range=args.gamma_range, gate_shape="smoothstep",
-            use_action_magnitude=use_action_magnitude,
-            use_state_token=use_state_token,
-        ).to(device)
-        adapter.load_state_dict(sd, strict=False)
-        adapter.eval()
+        config_path = Path(args.adapter_config) if args.adapter_config else Path(args.adapter_ckpt).with_name("config.json")
+        if config_path.exists():
+            from thermal_adapters.checkpoint import load_adapter
+            adapter = load_adapter(args.adapter_ckpt, config=config_path, device=device,
+                                   alpha=args.alpha, gamma_range=(args.adapter_gamma_range
+                                   if args.adapter_gamma_range is not None else args.gamma_range))
+            if args.adapter_gamma_log_space and not adapter.gamma_log_space:
+                raise ValueError("--adapter-gamma-log-space conflicts with saved config")
+        elif args.adapter_config:
+            raise FileNotFoundError(config_path)
+        else:
+            import warnings
+            warnings.warn("No config.json found: using explicitly supplied legacy architecture flags. "
+                          "Keep config.json beside the checkpoint for unambiguous loading.")
+            # Auto-detect architecture: joint_in (5 or 4), hidden, n_layers
+            use_action_magnitude = (sd['joint_proj.weight'].shape[1] == 5)
+            use_state_token = ('state_proj.weight' in sd)
+            hidden = sd['joint_proj.weight'].shape[0]
+            # Count transformer layers
+            n_layers = sum(1 for k in sd if k.startswith('transformer.layers.') and k.endswith('.norm1.weight'))
+            if n_layers == 0:
+                n_layers = args.n_layers
+            print(f"[load adapter] {args.adapter_ckpt} (state_dim={state_dim}, hidden={hidden}, n_layers={n_layers}, use_action_magnitude={use_action_magnitude}, use_state_token={use_state_token})", flush=True)
+            # gamma_log_space / the adapter's gamma_range are NOT recoverable from the
+            # state dict, so they must be supplied explicitly. Loading a log-space
+            # adapter under the linear formula silently computes the wrong gamma.
+            _agr = args.adapter_gamma_range if args.adapter_gamma_range is not None else args.gamma_range
+            adapter = TAMBoT(
+                state_dim=state_dim, act_dim=7,
+                hidden=hidden, n_layers=n_layers, n_heads=args.n_heads,
+                alpha=args.alpha, gamma_range=_agr, gate_shape="smoothstep",
+                gamma_log_space=args.adapter_gamma_log_space,
+                use_action_magnitude=use_action_magnitude,
+                use_state_token=use_state_token,
+            ).to(device)
+            if args.adapter_gamma_log_space:
+                print(f"  [adapter] log-space gamma, range={_agr}", flush=True)
+            adapter.load_state_dict(sd, strict=True)
+            adapter.eval()
 
     thermal = ThermalModel.from_predefined(args.env_curve, n_joints=7)
     current = CurrentModel.from_predefined(args.env_curve, n_joints=7)
     voltage = VoltageModel.from_predefined(args.env_curve, n_joints=7)
+    # Env-side rho-curve override (rebuttal: R1 W1 / R2 W3 -- randomized degradation
+    # models). Replaces each channel's capacity curve with an arbitrary family+params,
+    # so the released adapter is deployed against a degradation model it never saw.
+    if getattr(args, "env_curve_spec", ""):
+        _spec = json.loads(args.env_curve_spec)
+        if "T" in _spec:
+            thermal = ThermalModel.from_predefined(_spec["T"][0], params=_spec["T"][1], n_joints=7)
+        if "C" in _spec:
+            current = CurrentModel.from_predefined(_spec["C"][0], params=_spec["C"][1], n_joints=7)
+        if "V" in _spec:
+            voltage = VoltageModel.from_predefined(_spec["V"][0], params=_spec["V"][1], n_joints=7)
+        print(f"[curve spec override] {args.env_curve_spec}", flush=True)
+
+    # Env-side joint->OSC-axis grouping override (rebuttal: R1 Q4 / R2 Q1).
+    # The adapter is unchanged, so this measures how sensitive the deployed
+    # correction is to a mis-specified joint->axis mapping. Only ThermalModel
+    # exposes the grouping, so use temperature-only conditions (hot, T_mod),
+    # where current and voltage sit at nominal and their mapping is moot.
+    if getattr(args, "env_joint_grouping", ""):
+        _pj, _rj = args.env_joint_grouping.split(";")
+        thermal.position_joints = [int(x) for x in _pj.split(",") if x != ""]
+        thermal.rotation_joints = [int(x) for x in _rj.split(",") if x != ""]
+        print(f"[grouping override] position={thermal.position_joints} "
+              f"rotation={thermal.rotation_joints}", flush=True)
     if args.env_curve != "linear":
         print(f"[curve mismatch eval] env uses {args.env_curve} ρ; FFwd inverse uses linear (mis-specified); TAM trained on linear targets (also mis-specified)", flush=True)
 
@@ -607,7 +777,11 @@ def main():
                           mrac_gamma_max=args.mrac_gamma_max,
                           mrac_ema_alpha=args.mrac_ema_alpha,
                           mrac_low_pass_alpha=args.mrac_low_pass_alpha,
-                          log_corrections=args.log_corrections)
+                          closed_loop=args.closed_loop,
+                          cl_ema_alpha=args.cl_ema_alpha,
+                          cl_rho_assumed=args.cl_rho_assumed,
+                          cl_warmup=args.cl_warmup,
+                          log_corrections=args.log_corrections, online_sysid=args.online_sysid)
         if args.log_corrections:
             sr, corr = sr
             all_results[cond] = {"sr": sr, "n": args.episodes, "corr": corr}

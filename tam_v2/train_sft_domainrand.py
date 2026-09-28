@@ -221,6 +221,30 @@ def run_sft(adapter, all_states, all_actions, args, device):
     voltage_m = VoltageModel.from_predefined(curve_family, n_joints=7)
     if curve_family != "linear":
         print(f"  [curve family] {curve_family}", flush=True)
+
+    # ---- Domain randomisation over degradation curves -----------------------
+    # The released adapter trains against ONE curve, which is why its gain is
+    # conditional on the assumed curve matching reality (corr(base stressed SR,
+    # TAM gain) = -0.79; -3.2 pp on bases that are already coping). Here each
+    # sample group gets its own sampled (T, C, V) curve triple, so telemetry no
+    # longer determines rho and the L1 objective drives the adapter toward the
+    # conditional median correction instead of one tuned to a single curve.
+    n_curves = int(getattr(args, "n_curves", 0))
+    curve_models = None
+    if n_curves > 0:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from tam_v2.curve_sampler import sample_curve_set, describe
+        cset = sample_curve_set(n_curves, seed=getattr(args, "curve_seed", 0),
+                                wide=not getattr(args, "narrow_curves", False))
+        print(f"  [domain randomisation] {describe(cset)}", flush=True)
+        curve_models = []
+        for c in cset:
+            curve_models.append((
+                ThermalModel.from_predefined(c["T"][0], params=c["T"][1], n_joints=7),
+                CurrentModel.from_predefined(c["C"][0], params=c["C"][1], n_joints=7),
+                VoltageModel.from_predefined(c["V"][0], params=c["V"][1], n_joints=7),
+            ))
     alpha_mag = getattr(args, "alpha_mag", 0.0)
     if alpha_mag > 0:
         print(f"  [non-factorizable ρ] alpha_mag={alpha_mag} -- ρ_C(C,|a|) = ρ_C(C) * (1 - alpha_mag*|a|)", flush=True)
@@ -267,15 +291,21 @@ def run_sft(adapter, all_states, all_actions, args, device):
         # Bench-calibration noise on the SFT-target ρ (Limitation ii experiment).
         # ρ̂_target = ρ_true * (1 + σ * N(0,1)) — simulates noisy bench measurements.
         bench_sigma = getattr(args, "bench_calib_sigma", 0.0)
+        # Which curve triple generates each sample's target.
+        if curve_models is not None:
+            curve_idx = np.random.randint(0, len(curve_models), size=n)
         for i in range(n):
+            th_i, cu_i, vo_i = ((thermal, current_m, voltage_m)
+                                if curve_models is None
+                                else curve_models[curve_idx[i]])
             for j in range(7):
-                td = thermal.compute_degradation(float(T[i, j]), j)
-                cd_marginal = current_m.compute_degradation(float(C_eff[i, j]), j)
+                td = th_i.compute_degradation(float(T[i, j]), j)
+                cd_marginal = cu_i.compute_degradation(float(C_eff[i, j]), j)
                 if alpha_mag > 0:
                     cd = max(cd_marginal * (1.0 - alpha_mag * float(mag[i, j])), 0.05)
                 else:
                     cd = cd_marginal
-                vd = voltage_m.compute_degradation(float(V_eff[i, j]), j)
+                vd = vo_i.compute_degradation(float(V_eff[i, j]), j)
                 f = td * cd * vd
                 if bench_sigma > 0:
                     f = max(f * (1.0 + bench_sigma * float(np.random.normal())), 0.05)
@@ -735,6 +765,14 @@ def main():
     ap.add_argument("--coupling-CV", type=float, default=0.0,
                     help="Current->voltage coupling strength in SFT target generation. "
                          "If >0, V_eff = V - alpha_CV * C_eff during target generation.")
+    ap.add_argument("--n-curves", type=int, default=0,
+                    help="Domain randomisation: number of sampled (T,C,V) capacity-curve "
+                         "triples to generate SFT targets from. 0 = released behaviour "
+                         "(single fixed curve). Try 64.")
+    ap.add_argument("--curve-seed", type=int, default=0,
+                    help="Seed for the sampled curve set.")
+    ap.add_argument("--narrow-curves", action="store_true",
+                    help="Use the rebuttal script's narrower ranges instead of the wide ones.")
     ap.add_argument("--curve-family", type=str, default="linear",
                     choices=["linear", "exponential", "sigmoid", "polynomial", "kinky", "sin"],
                     help="Curve family for the degradation factor used in the SFT target. "

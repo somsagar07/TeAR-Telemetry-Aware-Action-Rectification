@@ -75,12 +75,24 @@ def kinky_current_degradation(current, breakpoints=None, values=None, min_cap=0.
     return min_cap
 
 
+def sin_current_degradation(current, onset=0.60, full=1.0, min_cap=0.10):
+    """Non-monotonic oscillating current capacity (curve-family mismatch test)."""
+    if current <= onset:
+        return 1.0
+    if current >= full:
+        return min_cap
+    u = (current - onset) / (full - onset)
+    osc = 0.5 * (1.0 + np.cos(3.0 * np.pi * u))
+    return max(min_cap, min_cap + (1.0 - min_cap) * osc)
+
+
 CURRENT_CURVE_REGISTRY = {
     "linear":      (linear_current_degradation,      {"onset": 0.60, "full": 1.0, "min_cap": 0.10}),
     "exponential": (exponential_current_degradation,  {"onset": 0.60, "k": 5.0, "min_cap": 0.10}),
     "sigmoid":     (sigmoid_current_degradation,      {"midpoint": 0.80, "k": 12.0, "min_cap": 0.10}),
     "polynomial":  (polynomial_current_degradation,   {"onset": 0.60, "full": 1.0, "degree": 2, "min_cap": 0.10}),
     "kinky":       (kinky_current_degradation,        {"min_cap": 0.10}),
+    "sin":         (sin_current_degradation,          {"onset": 0.60, "full": 1.0, "min_cap": 0.10}),
 }
 
 
@@ -141,12 +153,25 @@ def kinky_voltage_degradation(voltage, breakpoints=None, values=None, min_cap=0.
     return min_cap
 
 
+def sin_voltage_degradation(voltage, onset=0.90, full=0.50, min_cap=0.10):
+    """Non-monotonic oscillating voltage capacity (curve-family mismatch test).
+    Direction inverted: low voltage = high degradation."""
+    if voltage >= onset:
+        return 1.0
+    if voltage <= full:
+        return min_cap
+    u = (onset - voltage) / (onset - full)
+    osc = 0.5 * (1.0 + np.cos(3.0 * np.pi * u))
+    return max(min_cap, min_cap + (1.0 - min_cap) * osc)
+
+
 VOLTAGE_CURVE_REGISTRY = {
     "linear":      (linear_voltage_degradation,      {"onset": 0.90, "full": 0.50, "min_cap": 0.10}),
     "exponential": (exponential_voltage_degradation,  {"onset": 0.90, "k": 5.0, "min_cap": 0.10}),
     "sigmoid":     (sigmoid_voltage_degradation,      {"midpoint": 0.70, "k": 12.0, "min_cap": 0.10}),
     "polynomial":  (polynomial_voltage_degradation,   {"onset": 0.90, "full": 0.50, "degree": 2, "min_cap": 0.10}),
     "kinky":       (kinky_voltage_degradation,        {"min_cap": 0.10}),
+    "sin":         (sin_voltage_degradation,          {"onset": 0.90, "full": 0.50, "min_cap": 0.10}),
 }
 
 

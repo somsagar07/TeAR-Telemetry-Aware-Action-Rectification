@@ -1,104 +1,132 @@
-# Telemetry-Aware Manipulation (TAM)
+# TeAR: Telemetry-Aware Action Rectification
 
-Code release for *Test-Time Adaptation of Manipulation Policies Under Actuator
-Degradation*. TAM is a lightweight, frozen-policy adapter that reads onboard
-actuator telemetry (temperature, current, voltage) at test time and rectifies a
-base policy's action at the policy–controller interface. The correction is gated
-by a parameter-free smoothstep gate that is **identically zero** in the nominal
-regime, so the base policy is preserved bit-for-bit when the hardware is healthy.
+**Adapt a frozen manipulation policy to actuator stress using temperature, current, and voltage.**
 
-This repository contains the method, the multi-channel degradation model, the
-training and evaluation pipelines, and a real-robot deployment package. Trained
-checkpoints, datasets, and result dumps are **not** included; paths to them appear
-as placeholders (`<DATA_PATH>`, `datasets/...`) that you point at your own data.
+TeAR sits between a manipulation policy and its low-level controller. A small Transformer reads the proposed action, robot state, and actuator telemetry, then predicts a bounded action correction. A telemetry gate preserves the base command exactly under nominal conditions. Training uses existing demonstrations and simulated capacity curves, without collecting adapter rollouts or fine-tuning the base policy.
 
-## Repository layout
-
-```
-env/                     Multi-channel degradation model + Gym/robosuite environments
-  thermal_model.py         Temperature capacity factor (torque derating + noise)
-  telemetry_model.py       Current (saturation/ripple) + voltage (velocity limit/lag) + composer
-  thermal_lift_env.py      robosuite Lift wrapped with multi-channel degradation
-  thermal_curve_fitter.py  Fit degradation curves to logged actuator traces
-  *_lift_env.py            Panda / SO-101 task variants
-thermal_adapters/        The TAM adapter and its trainers
-  tam_bot.py               Released per-joint Transformer adapter (TAMBoT)
-  tam_bot_novel.py         Capacity / architecture variants (XL, FiLM, MoE)
-  sft_arch_variants.py     Trunk-architecture sweep (bottleneck, cross-attn, jointwise, ...)
-  train_sft_rl_kl_bct.py   Main severity-augmented supervised fine-tuning trainer
-  train_sft_arch.py        SFT trainer for the architecture-ablation variants
-frozen_base.py           Uniform interface to frozen robomimic BC / BC-Transformer checkpoints
-scripts/                 Evaluation + ablation drivers
-  eval_transfer_any_base.py   Core evaluator: any robomimic policy x condition (+ baselines)
-  eval_arch_variant.py        Evaluator for architecture-variant adapters
-  eval_analytic_feedforward.py / eval_telemetry.py   Reference baselines
-  aggregate_ablations.py      Aggregate the ablation result JSONs into tables
-  run_ablation_*.py           Multi-cell sweep orchestration (channel mask, coupled, severity, arch)
-  run_baseline_enrich.py      Analytic-inverse + MRAC baselines under coupled / non-factorisable physics
-  run_correction_analysis.py  Per-joint correction-magnitude logging
-openvla/                 Multi-policy telemetry evaluation (OpenVLA-OFT, GR00T, ACT, pi0)
-so101/tam_deploy/        Self-contained real-robot deployment (reads live servo telemetry)
-configs/                 robomimic BC / BC-Transformer training configs
-tests/                   Degradation-model + SO-101 integration tests
+```text
+Frozen policy ──► proposed action ──► TeAR ──► controller
+                                      ▲
+                              state + telemetry
 ```
 
-## Install
+The paper evaluates 18 policy–task pairs across eight policy families and five manipulation tasks. On the physical SO-101 arm, the simulation-trained adapter improves Lift success under heating from 75% and 70% to 85%, with 20 trials per method and condition and no on-robot fine-tuning.
+
+[Training and evaluation](#train) · [Reproduction guide](docs/reproduction.md) · [Method details](docs/method.md) · [SO-101 setup](so101/tam_deploy/README.md)
+
+This repository was previously named **TAM**. The GitHub URL, original script paths, checkpoint keys, and `--tam-*` arguments are retained for compatibility. The project and method are now **TeAR**.
+
+## Installation
+
+Run commands from the repository root. Python 3.10 is the reference environment.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+git clone https://github.com/somsagar07/TAM.git
+cd TAM
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The core (TAM training + robosuite evaluation) needs `torch`, `robosuite`,
-`mujoco`, and `robomimic`. The `openvla/` multi-policy evaluators additionally
-require the corresponding policy stacks (`transformers`, `peft`, GR00T, etc.) and
-are best run in their own environments; see the comments at the top of each
-script. MimicGen task variants (`Stack_D0`, `Threading_D0`) require `mimicgen`.
+The simulation stack uses robosuite 1.4.1, robomimic 0.3.0, NumPy 1.26.4, and MuJoCo 3.6.0. The recorded experiments used PyTorch 2.2.0; the requirements constrain PyTorch below 2.6 for compatibility with robomimic checkpoint loading. For GPU execution, install a compatible PyTorch CUDA build. On a headless NVIDIA host, configure the renderer with `export MUJOCO_GL=egl`.
 
-## Quick start
+**Required external inputs:** compatible base-policy checkpoints and robomimic demonstrations. These files are not bundled. Threading and Stack require MimicGen and its task assets. VLA integrations and the physical robot require their own policy environments or servo SDK; see the relevant directories.
 
-Train a TAM adapter on a frozen base policy (severity-augmented SFT, no env
-roll-outs, no base fine-tuning):
+## Train
+
+TeAR trains on demonstration state–action pairs augmented with four telemetry severity tiers. The reference adapter uses three Transformer layers, width 128, and four attention heads.
 
 ```bash
 python thermal_adapters/train_sft_rl_kl_bct.py \
-    --task-name Lift --base-ckpt <BASE_CKPT.pth> --demo-hdf5 <DEMOS.hdf5> \
-    --adapter-class tambot --hidden 128 --tam-n-layers 3 --tam-n-heads 4 \
-    --alpha 0.30 --tam-gamma-range 0.75 --gate-shape smoothstep \
-    --sft-steps 12000 --skip-rl --output-dir runs/tam_lift
+  --task-name Lift \
+  --base-ckpt checkpoints/base_lift.pth \
+  --demo-hdf5 datasets/lift.hdf5 \
+  --adapter-class tambot --hidden 128 \
+  --tam-n-layers 3 --tam-n-heads 4 \
+  --alpha 0.30 --tam-gamma-range 0.50 --gate-shape smoothstep \
+  --sft-steps 30000 --batch-size 256 --seed 42 --skip-rl \
+  --output-dir runs/tear_lift
 ```
 
-Evaluate the adapter across nominal and stressed conditions (temperature,
-current, voltage, and combined), reported against the frozen base:
+Keep the generated `config.json` beside `sft_adapter.pt`. Evaluation reads it to recover settings such as the attention-head count and gain formula. The reference training gain bound is 0.50; deployment uses 0.75. The BC–Can checkpoint in the paired mismatch study additionally used `--sft-input-noise 0.15`.
+
+For **DR-TeAR**, use `tam_v2/train_sft_domainrand.py` with the same arguments and add `--n-curves 64`. This variant samples capacity curves during training. See the [reproduction guide](docs/reproduction.md) for the saved configurations and evaluation protocol.
+
+## Evaluate
+
+Evaluate the frozen base and TeAR under nominal telemetry and seven stress conditions:
 
 ```bash
 python scripts/eval_transfer_any_base.py \
-    --ckpt <BASE_CKPT.pth> --task lift --adapter-ckpt runs/tam_lift/sft_adapter.pt \
-    --episodes 20 --horizon 250 --alpha 0.30 --gamma-range 0.75 \
-    --out results/tam_lift.json
+  --ckpt checkpoints/base_lift.pth --task lift \
+  --episodes 20 --horizon 250 --seed 42 \
+  --conditions cool hot stall brownout T_mod TC_mod TV_mod TCV_mod \
+  --out results/base_lift.json
+
+python scripts/eval_transfer_any_base.py \
+  --ckpt checkpoints/base_lift.pth --task lift \
+  --adapter-ckpt runs/tear_lift/sft_adapter.pt \
+  --alpha 0.30 --gamma-range 0.75 \
+  --episodes 20 --horizon 250 --seed 42 \
+  --conditions cool hot stall brownout T_mod TC_mod TV_mod TCV_mod \
+  --out results/tear_lift.json
 ```
 
-`eval_transfer_any_base.py` also implements the reference baselines used in the
-paper via flags: `--analytic-feedforward`, `--mrac-baseline`, `--scalar-gain`,
-and the broken-factorisation stress tests `--coupled-physics` /
-`--non-factorizable-rho`.
+Simulation actions are `[dx, dy, dz, dRoll, dPitch, dYaw, gripper]`. Temperature is in °C; current and voltage are normalized ratios. The gate closes at `T <= 42`, `C <= 0.60`, and `V >= 0.90` for each input index, preserving normalized base commands for finite deterministic network outputs.
 
-### Ablations
+### Paired evaluation under model mismatch
 
-The `run_ablation_*.py` / `run_baseline_enrich.py` / `run_correction_analysis.py`
-drivers reproduce the multi-cell sweeps. They read a manifest
-(`n50_manifest.json`) listing each `base x task` cell as
-`{cell, ckpt, adapter_ckpt, task, horizon}`; create one pointing at your trained
-checkpoints, then run the desired driver and `aggregate_ablations.py`.
+The paired protocol tests transfer to changed capacity curves. It matches initial conditions, telemetry, and random streams across methods, checks nominal trajectory identity, and records source and checkpoint hashes.
 
-## Real-robot deployment
+```bash
+export TEAR_CHECKPOINTS=/absolute/path/to/your/checkpoints
+# Edit this JSON to point to your base and adapter checkpoints.
+python -m experiments.mismatch.make_manifest \
+  --cells configs/release/mismatch_cells.example.json \
+  --out runs/mismatch/manifest.json
 
-`so101/tam_deploy/` is a standalone package: `dynamixel_telemetry.py` reads each
-servo's temperature, current, and voltage off the control table, and
-`tam_runtime.py` applies the trained adapter at the action interface. See
-`so101/tam_deploy/README.md` and `example_loop.py`. Point the runtime at a
-trained `sft_adapter.pt`.
+# Inspect the 108 jobs in the complete four-pair study.
+python -m experiments.mismatch.run \
+  --manifest runs/mismatch/manifest.json \
+  --results runs/mismatch/results --dry-run
+
+# Remove --dry-run to execute, then validate and summarize the results.
+python -m experiments.mismatch.aggregate \
+  --manifest runs/mismatch/manifest.json \
+  --results runs/mismatch/results --out runs/mismatch/summary
+```
+
+The study compares the frozen base, TeAR, DR-TeAR, an assumed-model inverse, and a privileged inverse with access to the test curves. Reports include success rates, paired gains, confidence intervals, and action diagnostics. Incomplete or unpaired results are rejected by default. See [the protocol and artifact requirements](docs/reproduction.md) before reproducing paper results with replacement checkpoints.
+
+## Repository layout
+
+| Directory | Contents |
+|---|---|
+| `thermal_adapters/` | Reference adapter, supervised training, and architecture ablations |
+| `env/` | Temperature, current, and voltage degradation models |
+| `scripts/` | Policy evaluation and supplementary experiments |
+| `experiments/mismatch/` | Paired evaluation, manifest creation, and result aggregation |
+| `tam_v2/` | DR-TeAR training and experimental feedback correction |
+| `configs/release/` | Reference settings and checkpoint-manifest example |
+| `openvla/` | VLA integrations with separate environment requirements |
+| `so101/` | Physical-arm runtime and setup instructions |
+| `tests/` | Adapter, degradation, evaluation, and aggregation checks |
+
+## Tests
+
+For CPU tests without installing the simulator:
+
+```bash
+pip install -r requirements-test.txt
+python -m pytest -q
+```
+
+Tests check exact nominal pass-through, bounded correction, checkpoint loading, degradation behavior, paired evaluation, and aggregation. The two SO-101 simulation tests skip when the external robot assets and `register_so101` module are unavailable.
+
+## Compatibility
+
+Existing checkpoints continue to use `thermal_adapters.tam_bot.TAMBoT`, `sft_adapter.pt`, and `tam_*` configuration fields. They do not need conversion. The SO-101 runtime retains its standalone filenames and uses a different action interface from the Panda OSC model. See [release and compatibility notes](docs/migration.md).
 
 ## License
 
-Released under the MIT License (see `LICENSE`).
+[MIT](LICENSE). Third-party code and dependencies retain their respective licenses.

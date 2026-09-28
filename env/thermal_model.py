@@ -79,12 +79,27 @@ def kinky_degradation(temp, breakpoints=None, values=None, min_cap=0.05):
 
 
 # Registry mapping names to (function, default_params)
+def sin_degradation(temp, onset=43.0, full=75.0, min_cap=0.05):
+    """Non-monotonic oscillating capacity (worst-case curve-family mismatch).
+    Capacity is 1 in the nominal regime; in the stressed band it oscillates
+    smoothly between min_cap and 1 — neither monotonically degrading nor
+    factorisable by severity tier."""
+    if temp <= onset:
+        return 1.0
+    if temp >= full:
+        return min_cap
+    u = (temp - onset) / (full - onset)
+    osc = 0.5 * (1.0 + np.cos(3.0 * np.pi * u))
+    return max(min_cap, min_cap + (1.0 - min_cap) * osc)
+
+
 CURVE_REGISTRY = {
     "linear": (linear_degradation, {"onset": 43.0, "full": 75.0, "min_cap": 0.05}),
     "exponential": (exponential_degradation, {"onset": 43.0, "k": 0.08, "min_cap": 0.05}),
     "sigmoid": (sigmoid_degradation, {"midpoint": 59.0, "k": 0.2, "min_cap": 0.05}),
     "polynomial": (polynomial_degradation, {"onset": 43.0, "full": 75.0, "degree": 2, "min_cap": 0.05}),
     "kinky": (kinky_degradation, {"min_cap": 0.05}),
+    "sin": (sin_degradation, {"onset": 43.0, "full": 75.0, "min_cap": 0.05}),
 }
 
 

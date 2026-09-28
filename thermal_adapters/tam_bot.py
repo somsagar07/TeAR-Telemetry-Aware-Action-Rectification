@@ -1,33 +1,11 @@
-"""TAM-BoT — Body-Token Telemetry Adapter.
+"""Telemetry-Aware Action Rectification (TeAR).
 
-A small (~70K-param) transformer-based adapter that wraps a frozen base policy
-under multi-channel joint degradation. Combines:
-
-  1. Per-joint tokens (Body-Transformer style; Sferrazza 2024 arXiv:2408.06316).
-     Each joint gets its own token; self-attention discovers cross-joint coupling.
-
-  2. Dual output per joint: multiplicative scale γ (FiLM-style; Perez 2018
-     arXiv:1709.07871) AND additive residual δ. The multiplicative head matches
-     the physics — degradation is multiplicative (T_factor × C_factor × V_factor),
-     so the natural inverse is also multiplicative. The residual head handles
-     direction-correcting nudges that pure scaling can't express.
-
-  3. Per-joint smoothstep gate. Hard-zero at nominal (max_T<=42, max_C<=0.60,
-     min_V>=0.90), 3x²-2x³ ramp through the moderate range, fully on at full
-     stress. Gentler at the warm shoulder than linear ramp (fixes the Can T=55
-     regression observed in track 1).
-
-Action rule (per joint j):
-
-    γ_j = 1 + g_j · γ_range · tanh(γ_logit_j)     ∈ [1-γ_range, 1+γ_range]
-    δ_j = g_j · α · tanh(δ_logit_j)               ∈ [-α, α]
-    a_final[j] = clip(γ_j · a_base[j] + δ_j, -1, 1)
-
-At cool (g=0): γ=1, δ=0  ⇒  a_final = clip(a_base) = a_base  bit-exactly.
-This is structural — no reliance on SFT to "discover" identity.
-
-Inputs (matching BCTSFTRLAdapter signature):
-  forward(a_base, temps, state, currents, voltages) -> (mean, log_std, value)
+A telemetry-gated Transformer applies bounded scale-and-shift corrections to a
+frozen policy's normalized action. The deterministic forward pass preserves
+nominal actions exactly for finite outputs. OSC action indices are paired with
+telemetry indices as a representation, not a physical joint-to-axis mapping.
+Legacy constructor defaults and state-dict keys are retained for compatibility;
+the paper configuration uses hidden=128, n_layers=3, n_heads=4.
 """
 import torch
 import torch.nn as nn
@@ -301,7 +279,7 @@ def count_params(model: nn.Module) -> int:
 if __name__ == "__main__":
     # Smoke test
     m = TAMBoT(state_dim=19, hidden=64, n_layers=2, n_heads=4)
-    print(f"TAM-BoT params: {count_params(m):,}")
+    print(f"TeAR params: {count_params(m):,}")
     B = 4
     a = torch.randn(B, 7).clamp(-1, 1)
     T = torch.full((B, 7), 25.0)

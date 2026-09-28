@@ -1,0 +1,34 @@
+{
+  "bc_lift": {
+    "task": "lift",
+    "label": "BC",
+    "horizon": 250,
+    "ckpt": "${TEAR_CHECKPOINTS}/base/bc_lift.pth",
+    "tear": "${TEAR_CHECKPOINTS}/tear/bc_lift/sft_adapter.pt",
+    "tear_dr": "${TEAR_CHECKPOINTS}/tear_dr/bc_lift/sft_adapter.pt"
+  },
+  "bc_can": {
+    "task": "can",
+    "label": "BC",
+    "horizon": 400,
+    "ckpt": "${TEAR_CHECKPOINTS}/base/bc_can.pth",
+    "tear": "${TEAR_CHECKPOINTS}/tear/bc_can/sft_adapter.pt",
+    "tear_dr": "${TEAR_CHECKPOINTS}/tear_dr/bc_can/sft_adapter.pt"
+  },
+  "bct_square": {
+    "task": "square",
+    "label": "BC-Transformer",
+    "horizon": 400,
+    "ckpt": "${TEAR_CHECKPOINTS}/base/bct_square.pth",
+    "tear": "${TEAR_CHECKPOINTS}/tear/bct_square/sft_adapter.pt",
+    "tear_dr": "${TEAR_CHECKPOINTS}/tear_dr/bct_square/sft_adapter.pt"
+  },
+  "iris_square": {
+    "task": "square",
+    "label": "IRIS",
+    "horizon": 400,
+    "ckpt": "${TEAR_CHECKPOINTS}/base/iris_square.pth",
+    "tear": "${TEAR_CHECKPOINTS}/tear/iris_square/sft_adapter.pt",
+    "tear_dr": "${TEAR_CHECKPOINTS}/tear_dr/iris_square/sft_adapter.pt"
+  }
+}

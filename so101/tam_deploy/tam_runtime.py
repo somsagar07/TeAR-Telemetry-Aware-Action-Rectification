@@ -34,7 +34,10 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 # tam_bot.py is vendored into this deploy package — no repo-root path needed.
-from tam_bot import TAMBoT
+try:
+    from .tam_bot import TAMBoT
+except ImportError:  # Standalone deployment directory.
+    from tam_bot import TAMBoT
 
 
 SO101_N_JOINTS = 5     # 5 arm joints — what TAM corrects

@@ -1,0 +1,15 @@
+{
+  "adapter_class": "tambot",
+  "hidden": 128,
+  "tam_n_layers": 3,
+  "tam_n_heads": 4,
+  "alpha": 0.3,
+  "tam_gamma_range": 0.5,
+  "gate_shape": "smoothstep",
+  "sft_steps": 30000,
+  "sft_lr": 0.0005,
+  "batch_size": 256,
+  "seed": 42,
+  "skip_rl": true,
+  "deployment_gamma_range": 0.75
+}
